@@ -100,26 +100,37 @@ def main(script_args, training_args, model_args, dataset_args):
         print("No fsdp_config detected!")
 
     # --- Mistral 3.1 Detection ---
-    model_id = model_args.model_name_or_path.lower()
+    model_id = getattr(model_args, "model_name_or_path", "").lower()
     is_mistral_small_3 = "mistral-small-3.1" in model_id or "mistral3" in model_id
 
     ################
     # Model
     ###################
-    # Force bfloat16 for Mistral 3.1, otherwise follow config
-    if is_mistral_small_3 and model_args.torch_dtype in ["auto", "bf16", None]:
+    # Use getattr to prevent AttributeError if torch_dtype is missing in ModelConfig
+    config_dtype = getattr(model_args, "torch_dtype", "auto")
+
+    if is_mistral_small_3 and config_dtype in ["auto", "bf16", None]:
         torch_dtype = torch.bfloat16
     else:
-        torch_dtype = (
-            model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch,
-                                                                                            model_args.torch_dtype)
-        )
+        # Standard logic for other models
+        if config_dtype in ["auto", None]:
+            torch_dtype = torch.float32  # Safe fallback
+        elif hasattr(torch, config_dtype):
+            torch_dtype = getattr(torch, config_dtype)
+        else:
+            torch_dtype = torch.float32
 
-    # dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
+    # Safely get other model arguments
+    attn_impl = getattr(model_args, "attn_implementation", "auto")
+    revision = getattr(model_args, "model_revision", None)
+    trust_remote = getattr(model_args, "trust_remote_code", False)
+
+    if is_mistral_small_3 and attn_impl == "auto":
+        attn_impl = "eager"
+
     model_kwargs = dict(
-        revision=model_args.model_revision,
-        attn_implementation=model_args.attn_implementation,
-        # dtype=dtype,
+        revision=revision,
+        attn_implementation=attn_impl,
         torch_dtype=torch_dtype,
         # dtype = torch_dtype
     )
@@ -158,7 +169,7 @@ def main(script_args, training_args, model_args, dataset_args):
     #     quantization_config=quantization_config,
     # )
     model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+        model_args.model_name_or_path, trust_remote_code=trust_remote, **model_kwargs
     )
     peft_config = get_peft_config(model_args)
 
@@ -170,24 +181,19 @@ def main(script_args, training_args, model_args, dataset_args):
             r"(q_proj|k_proj|v_proj|o_proj)$"
         )
 
-    if (
-        not hasattr(training_args, "ref_model_path") or
-        (
-            training_args.ref_model_path is None
-            and isinstance(model_args.model_name_or_path, str)
-        )
-        ):
-        # If the reference model is not specified, assume it is the same as the initial modelAdd commentMore actions
+    # Safely handle ref_model_path
+    ref_model_path = getattr(training_args, "ref_model_path", None)
+    if ref_model_path is None and isinstance(model_args.model_name_or_path, str):
         training_args.ref_model_path = model_args.model_name_or_path
     if peft_config is None:
         ref_model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+            model_args.model_name_or_path, trust_remote_code=trust_remote, **model_kwargs
         )
         # ref_model = training_args.ref_model_path # DPOTrainer takes care of initializing the reference model
     else:
         ref_model = None
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
+        model_args.model_name_or_path, trust_remote_code=trust_remote
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
