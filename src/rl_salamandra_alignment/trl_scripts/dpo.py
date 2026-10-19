@@ -81,8 +81,9 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
+# --- FIX: Defined manually to avoid ImportError on older TRL versions ---
+SIMPLE_CHAT_TEMPLATE = "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}{% endfor %}"
 
 logger = logging.get_logger(__name__)
 
