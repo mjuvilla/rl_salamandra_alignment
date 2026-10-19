@@ -68,7 +68,7 @@ import torch
 from accelerate import logging
 from datasets import load_dataset, load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from transformers.models.auto import modeling_auto  # Added for Mistral 3.1 hack
 from trl import (
     DatasetMixtureConfig,
     DPOConfig,
@@ -97,13 +97,23 @@ def main(script_args, training_args, model_args, dataset_args):
         print(training_args.fsdp_config)
     else:
         print("No fsdp_config detected!")
+
+    # --- Mistral 3.1 Detection ---
+    model_id = model_args.model_name_or_path.lower()
+    is_mistral_small_3 = "mistral-small-3.1" in model_id or "mistral3" in model_id
+
     ################
     # Model
     ###################
-    torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
-    )
-    
+    # Force bfloat16 for Mistral 3.1, otherwise follow config
+    if is_mistral_small_3 and model_args.torch_dtype in ["auto", "bf16", None]:
+        torch_dtype = torch.bfloat16
+    else:
+        torch_dtype = (
+            model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch,
+                                                                                            model_args.torch_dtype)
+        )
+
     # dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
     model_kwargs = dict(
         revision=model_args.model_revision,
@@ -112,6 +122,11 @@ def main(script_args, training_args, model_args, dataset_args):
         torch_dtype=torch_dtype,
         # dtype = torch_dtype
     )
+
+    # Mistral 3.1 is unstable with some attn implementations; default to eager if auto
+    if is_mistral_small_3 and model_kwargs["attn_implementation"] == "auto":
+        model_kwargs["attn_implementation"] = "eager"
+
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
         # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
@@ -133,7 +148,7 @@ def main(script_args, training_args, model_args, dataset_args):
     # print("quantization_config:", quantization_config)
     # import time
     # time.sleep(10)
-        
+
     # model_kwargs = dict(
     #     revision=model_args.model_revision,
     #     attn_implementation=model_args.attn_implementation,
@@ -145,6 +160,14 @@ def main(script_args, training_args, model_args, dataset_args):
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
     peft_config = get_peft_config(model_args)
+
+    # --- FIX: LoRA Targeting for Mistral 3.1 ---
+    if is_mistral_small_3 and peft_config is not None:
+        logger.info("Mistral Small 3.1 detected: Applying custom LoRA target modules.")
+        peft_config.target_modules = (
+            r"^language_model\.model\.layers\.\d+\.self_attn\."
+            r"(q_proj|k_proj|v_proj|o_proj)$"
+        )
 
     if (
         not hasattr(training_args, "ref_model_path") or
@@ -191,16 +214,29 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
-    # Initialize the DPO trainer
-    trainer = DPOTrainer(
-        model,
-        ref_model,
-        args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=tokenizer,
-        peft_config=peft_config,
-    )
+    # --- FIX: Vision Registry Hack for Mistral 3.1 ---
+    if is_mistral_small_3:
+        logger.info("Mistral Small 3.1 detected: Applying TRL Vision Registry hack.")
+        mapping = modeling_auto.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
+        original_mistral3_entry = mapping.pop("mistral3", None)
+        try:
+            trainer = DPOTrainer(
+                model, ref_model, args=training_args,
+                train_dataset=dataset[script_args.dataset_train_split],
+                eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+                processing_class=tokenizer, peft_config=peft_config,
+            )
+        finally:
+            if original_mistral3_entry is not None:
+                mapping["mistral3"] = original_mistral3_entry
+    else:
+        # Normal path for all other models
+        trainer = DPOTrainer(
+            model, ref_model, args=training_args,
+            train_dataset=dataset[script_args.dataset_train_split],
+            eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+            processing_class=tokenizer, peft_config=peft_config,
+        )
 
     # Train the model
     trainer.train()
