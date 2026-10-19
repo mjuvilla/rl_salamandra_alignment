@@ -67,11 +67,7 @@ import os
 import torch
 from accelerate import logging
 from datasets import load_dataset, load_from_disk
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForConditionalGeneration, # ADDED: Required for Mistral 3.1
-    AutoTokenizer
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.auto import modeling_auto
 from trl import (
     DatasetMixtureConfig,
@@ -86,7 +82,7 @@ from trl import (
     get_quantization_config,
 )
 
-# --- FIX: Defined manually to avoid ImportError on older TRL versions ---
+# Defined manually to avoid ImportError on older TRL versions
 SIMPLE_CHAT_TEMPLATE = "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}{% endfor %}"
 
 logger = logging.get_logger(__name__)
@@ -149,12 +145,17 @@ def main(script_args, training_args, model_args, dataset_args):
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
-    # --- FIX: Conditional Loading Class ---
-    # Mistral 3.1 MUST be loaded via AutoModelForConditionalGeneration
+    # Direct Class Import to bypass missing AutoModelForConditionalGeneration ---
     if is_mistral_small_3:
-        logger.info("Mistral Small 3.1 detected: Loading via AutoModelForConditionalGeneration")
-        model_class = AutoModelForConditionalGeneration
+        logger.info("Mistral Small 3.1 detected: Importing Mistral3ForConditionalGeneration directly")
+        try:
+            from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+            model_class = Mistral3ForConditionalGeneration
+        except ImportError as e:
+            logger.error("Could not import Mistral3ForConditionalGeneration. Please check transformers version.")
+            raise e
     else:
+        logger.info("Using normal model loader")
         model_class = AutoModelForCausalLM
 
     model = model_class.from_pretrained(
@@ -162,7 +163,7 @@ def main(script_args, training_args, model_args, dataset_args):
     )
     peft_config = get_peft_config(model_args)
 
-    # --- FIX: LoRA Targeting for Mistral 3.1 ---
+    # LoRA Targeting for Mistral 3.1
     if is_mistral_small_3 and peft_config is not None:
         logger.info("Mistral Small 3.1 detected: Applying custom LoRA target modules.")
         peft_config.target_modules = (
