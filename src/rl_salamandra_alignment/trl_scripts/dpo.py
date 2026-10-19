@@ -67,8 +67,12 @@ import os
 import torch
 from accelerate import logging
 from datasets import load_dataset, load_from_disk
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.auto import modeling_auto  # Added for Mistral 3.1 hack
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForConditionalGeneration, # ADDED: Required for Mistral 3.1
+    AutoTokenizer
+)
+from transformers.models.auto import modeling_auto
 from trl import (
     DatasetMixtureConfig,
     DPOConfig,
@@ -145,30 +149,15 @@ def main(script_args, training_args, model_args, dataset_args):
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
-    # ################
-    # # Model & Tokenizer
-    # ###################
-    # torch_dtype = (
-    #     model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
-    # )
-    # quantization_config = get_quantization_config(model_args)
-    # if quantization_config is None:
-    #     from transformers import AutoConfig
-    #     quantization_config = AutoConfig.from_pretrained(
-    #         model_args.model_name_or_path
-    #     ).quantization_config
-    # print("quantization_config:", quantization_config)
-    # import time
-    # time.sleep(10)
+    # --- FIX: Conditional Loading Class ---
+    # Mistral 3.1 MUST be loaded via AutoModelForConditionalGeneration
+    if is_mistral_small_3:
+        logger.info("Mistral Small 3.1 detected: Loading via AutoModelForConditionalGeneration")
+        model_class = AutoModelForConditionalGeneration
+    else:
+        model_class = AutoModelForCausalLM
 
-    # model_kwargs = dict(
-    #     revision=model_args.model_revision,
-    #     attn_implementation=model_args.attn_implementation,
-    #     torch_dtype=torch_dtype,
-    #     # device_map=get_kbit_device_map() if quantization_config is not None else None,
-    #     quantization_config=quantization_config,
-    # )
-    model = AutoModelForCausalLM.from_pretrained(
+    model = model_class.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=trust_remote, **model_kwargs
     )
     peft_config = get_peft_config(model_args)
@@ -186,7 +175,8 @@ def main(script_args, training_args, model_args, dataset_args):
     if ref_model_path is None and isinstance(model_args.model_name_or_path, str):
         training_args.ref_model_path = model_args.model_name_or_path
     if peft_config is None:
-        ref_model = AutoModelForCausalLM.from_pretrained(
+        # Reference model must use the same class as the main model
+        ref_model = model_class.from_pretrained(
             model_args.model_name_or_path, trust_remote_code=trust_remote, **model_kwargs
         )
         # ref_model = training_args.ref_model_path # DPOTrainer takes care of initializing the reference model
