@@ -66,9 +66,9 @@ import os
 
 import torch
 from accelerate import logging
-from datasets import load_dataset, load_from_disk
+from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.auto import modeling_auto
+
 from trl import (
     DatasetMixtureConfig,
     DPOConfig,
@@ -86,7 +86,6 @@ from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 logger = logging.get_logger(__name__)
 
-# Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
@@ -98,45 +97,28 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         print("No fsdp_config detected!")
 
-    # --- Mistral 3.1 Detection ---
-    model_id = getattr(model_args, "model_name_or_path", "").lower()
-    is_mistral_small_3 = "mistral-small-3.1" in model_id or "mistral3" in model_id
+    model_id = str(model_args.model_name_or_path).lower()
+    is_mistral_small_3 = (
+        "mistral-small-3.1" in model_id
+        or "mistral3" in model_id
+    )
 
-    ################
-    # Model
-    ###################
-    # Use getattr to prevent AttributeError if torch_dtype is missing in ModelConfig
-    config_dtype = getattr(model_args, "torch_dtype", "auto")
+    torch_dtype = (
+        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+    )
 
-    if is_mistral_small_3 and config_dtype in ["auto", "bf16", None]:
-        torch_dtype = torch.bfloat16
-    else:
-        # Standard logic for other models
-        if config_dtype in ["auto", None]:
-            torch_dtype = torch.float32  # Safe fallback
-        elif hasattr(torch, config_dtype):
-            torch_dtype = getattr(torch, config_dtype)
-        else:
-            torch_dtype = torch.float32
+    attn_impl = model_args.attn_implementation
 
-    # Safely get other model arguments
-    attn_impl = getattr(model_args, "attn_implementation", "auto")
-    revision = getattr(model_args, "model_revision", None)
-    trust_remote = getattr(model_args, "trust_remote_code", False)
-
+    # Minimal Mistral-specific adjustment:
+    # use eager only when the configuration requests auto.
     if is_mistral_small_3 and attn_impl == "auto":
         attn_impl = "eager"
 
     model_kwargs = dict(
-        revision=revision,
+        revision=model_args.model_revision,
         attn_implementation=attn_impl,
         torch_dtype=torch_dtype,
-        # dtype = torch_dtype
     )
-
-    # Mistral 3.1 is unstable with some attn implementations; default to eager if auto
-    if is_mistral_small_3 and model_kwargs["attn_implementation"] == "auto":
-        model_kwargs["attn_implementation"] = "eager"
 
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
@@ -144,48 +126,194 @@ def main(script_args, training_args, model_args, dataset_args):
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
-    # Direct Class Import to bypass missing AutoModelForConditionalGeneration ---
+    # Model loading
     if is_mistral_small_3:
-        logger.info("Mistral Small 3.1 detected: Importing Mistral3ForConditionalGeneration directly")
+        logger.info(
+            "Mistral Small 3.1 detected; loading "
+            "Mistral3ForConditionalGeneration."
+        )
+
         try:
-            from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
-            model_class = Mistral3ForConditionalGeneration
+            from transformers.models.mistral3.modeling_mistral3 import (
+                Mistral3ForConditionalGeneration,
+            )
         except ImportError as e:
-            logger.error("Could not import Mistral3ForConditionalGeneration. Please check transformers version.")
-            raise e
+            raise ImportError(
+                "Could not import Mistral3ForConditionalGeneration. "
+                "Check that your Transformers version supports Mistral Small 3.1."
+            ) from e
+
+        model_class = Mistral3ForConditionalGeneration
     else:
-        logger.info("Using normal model loader")
+        logger.info("Using AutoModelForCausalLM.")
         model_class = AutoModelForCausalLM
 
     model = model_class.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=trust_remote, **model_kwargs
+        model_args.model_name_or_path,
+        trust_remote_code=model_args.trust_remote_code,
+        **model_kwargs,
     )
+
+    # PEFT / LoRA configuration
     peft_config = get_peft_config(model_args)
 
-    # LoRA Targeting for Mistral 3.1
     if is_mistral_small_3 and peft_config is not None:
-        peft_config.target_modules = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
+        projection_names = {"q_proj", "k_proj", "v_proj", "o_proj"}
+
+        # Inspect the actual model instead of assuming a fixed prefix.
+        all_modules = [
+            name
+            for name, _ in model.named_modules()
+            if name
         ]
 
-    # Safely handle ref_model_path
-    ref_model_path = getattr(training_args, "ref_model_path", None)
-    if ref_model_path is None and isinstance(model_args.model_name_or_path, str):
-        training_args.ref_model_path = model_args.model_name_or_path
-    if peft_config is None:
-        # Reference model must use the same class as the main model
-        ref_model = model_class.from_pretrained(
-            model_args.model_name_or_path, trust_remote_code=trust_remote, **model_kwargs
+        print("\n" + "=" * 80)
+        print("MISTRAL SMALL 3.1: PEFT MODULE INSPECTION")
+        print("=" * 80)
+
+        print("\nAttention projection modules found in the model:")
+
+        attention_modules = [
+            name
+            for name in all_modules
+            if ".self_attn." in name
+            and name.rsplit(".", 1)[-1] in projection_names
+        ]
+
+        if not attention_modules:
+            print("WARNING: No matching attention projection modules found.")
+            print("\nModule names containing 'attn' or 'proj' (first 100):")
+
+            diagnostic_modules = [
+                name
+                for name in all_modules
+                if "attn" in name.lower() or "proj" in name.lower()
+            ]
+
+            for name in diagnostic_modules[:100]:
+                print(f"  {name}")
+
+            raise RuntimeError(
+                "Could not find q_proj/k_proj/v_proj/o_proj inside "
+                "self_attn modules. Inspect the diagnostic module names "
+                "above before configuring LoRA."
+            )
+
+        for name in attention_modules:
+            print(f"  {name}")
+
+        # Restrict LoRA to the language model's attention layers.
+        # Using the actual full names avoids assuming whether the prefix
+        # is model.language_model, language_model.model, or something else.
+        target_modules = [
+            name
+            for name in attention_modules
+            if "language_model" in name and ".layers." in name
+        ]
+
+        print("\nSelected LoRA target modules:")
+
+        if not target_modules:
+            print(
+                "WARNING: No language-model layer names matched the "
+                "expected structural pattern."
+            )
+            print("\nAvailable language_model module names (first 100):")
+
+            language_modules = [
+                name
+                for name in all_modules
+                if "language_model" in name
+                and ".self_attn." in name
+            ]
+
+            for name in language_modules[:100]:
+                print(f"  {name}")
+
+            raise RuntimeError(
+                "Could not identify language-model attention layers. "
+                "Inspect the printed module names and adjust the filter."
+            )
+
+        for name in target_modules:
+            print(f"  {name}")
+
+        # Confirm that all four projection types are represented.
+        found_projections = {
+            name.rsplit(".", 1)[-1]
+            for name in target_modules
+        }
+
+        missing_projections = projection_names - found_projections
+
+        if missing_projections:
+            raise RuntimeError(
+                f"Missing expected LoRA projections: "
+                f"{sorted(missing_projections)}"
+            )
+
+        print(f"\nTotal selected modules: {len(target_modules)}")
+        print(f"Projection types: {sorted(found_projections)}")
+        print("=" * 80 + "\n")
+
+        # PEFT accepts exact module names in target_modules lists.
+        # This avoids fragile, hard-coded regular expressions.
+        peft_config.target_modules = target_modules
+
+    # Reference model
+    if (
+        not hasattr(training_args, "ref_model_path")
+        or (
+            training_args.ref_model_path is None
+            and isinstance(model_args.model_name_or_path, str)
         )
-        # ref_model = training_args.ref_model_path # DPOTrainer takes care of initializing the reference model
+    ):
+        # If the reference model is not specified, assume it is the same as the initial modelAdd commentMore actions
+        training_args.ref_model_path = model_args.model_name_or_path
+
+    if peft_config is None:
+        ref_model = model_class.from_pretrained(
+            model_args.model_name_or_path,
+            trust_remote_code=model_args.trust_remote_code,
+            **model_kwargs,
+        )
     else:
+        # With PEFT, DPOTrainer handles reference-policy behavior.
         ref_model = None
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=trust_remote
-    )
+
+    # Tokenizer
+    tokenizer_kwargs = {
+        "trust_remote_code": model_args.trust_remote_code,
+    }
+
+    if is_mistral_small_3:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.model_name_or_path,
+                fix_mistral_regex=True,
+                **tokenizer_kwargs,
+            )
+        except TypeError as e:
+            # Compatibility fallback for older Transformers versions.
+            if "fix_mistral_regex" not in str(e):
+                raise
+
+            logger.warning(
+                "This Transformers version does not support "
+                "fix_mistral_regex=True. The tokenizer will be loaded "
+                "without that fix; upgrading Transformers is recommended."
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.model_name_or_path,
+                **tokenizer_kwargs,
+            )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            **tokenizer_kwargs,
+        )
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.chat_template is None:
@@ -212,29 +340,16 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
-    # --- FIX: Vision Registry Hack for Mistral 3.1 ---
-    if is_mistral_small_3:
-        logger.info("Mistral Small 3.1 detected: Applying TRL Vision Registry hack.")
-        mapping = modeling_auto.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
-        original_mistral3_entry = mapping.pop("mistral3", None)
-        try:
-            trainer = DPOTrainer(
-                model, ref_model, args=training_args,
-                train_dataset=dataset[script_args.dataset_train_split],
-                eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-                processing_class=tokenizer, peft_config=peft_config,
-            )
-        finally:
-            if original_mistral3_entry is not None:
-                mapping["mistral3"] = original_mistral3_entry
-    else:
-        # Normal path for all other models
-        trainer = DPOTrainer(
-            model, ref_model, args=training_args,
-            train_dataset=dataset[script_args.dataset_train_split],
-            eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-            processing_class=tokenizer, peft_config=peft_config,
-        )
+    # Initialize the DPO trainer
+    trainer = DPOTrainer(
+        model,
+        ref_model,
+        args=training_args,
+        train_dataset=dataset[script_args.dataset_train_split],
+        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        processing_class=tokenizer,
+        peft_config=peft_config,
+    )
 
     # Train the model
     trainer.train()
