@@ -82,8 +82,7 @@ from trl import (
     get_quantization_config,
 )
 
-# Defined manually to avoid ImportError on older TRL versions
-SIMPLE_CHAT_TEMPLATE = "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}{% endfor %}"
+from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 logger = logging.get_logger(__name__)
 
@@ -165,11 +164,12 @@ def main(script_args, training_args, model_args, dataset_args):
 
     # LoRA Targeting for Mistral 3.1
     if is_mistral_small_3 and peft_config is not None:
-        logger.info("Mistral Small 3.1 detected: Applying custom LoRA target modules.")
-        peft_config.target_modules = (
-            r"^language_model\.model\.layers\.\d+\.self_attn\."
-            r"(q_proj|k_proj|v_proj|o_proj)$"
-        )
+        peft_config.target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+        ]
 
     # Safely handle ref_model_path
     ref_model_path = getattr(training_args, "ref_model_path", None)
