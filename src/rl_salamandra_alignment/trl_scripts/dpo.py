@@ -243,6 +243,9 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
+    if peft_config is not None and training_args.gradient_checkpointing:
+        model.enable_input_require_grads()
+
     # Initialize the DPO trainer
     # --- FIX: Vision Registry Hack for Mistral 3.1 ---
     if is_mistral_small_3:
@@ -277,6 +280,30 @@ def main(script_args, training_args, model_args, dataset_args):
             eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
             processing_class=tokenizer, peft_config=peft_config,
         )
+
+    ## TESTS
+    trainable_params = 0
+    total_params = 0
+
+    for name, param in trainer.model.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+            if "lora_" in name:
+                print(
+                    f"Trainable LoRA parameter: {name}, "
+                    f"shape={tuple(param.shape)}"
+                )
+
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(
+        f"Trainable percentage: "
+        f"{100 * trainable_params / total_params:.6f}%"
+    )
+
+    assert trainable_params > 0, "No trainable parameters!"
+    ## TESTS
 
     # Train the model
     trainer.train()
