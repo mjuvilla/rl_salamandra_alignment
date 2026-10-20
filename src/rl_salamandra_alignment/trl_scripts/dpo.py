@@ -69,6 +69,8 @@ from accelerate import logging
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from transformers.models.auto import modeling_auto
+
 from trl import (
     DatasetMixtureConfig,
     DPOConfig,
@@ -158,107 +160,12 @@ def main(script_args, training_args, model_args, dataset_args):
     peft_config = get_peft_config(model_args)
 
     if is_mistral_small_3 and peft_config is not None:
-        projection_names = {"q_proj", "k_proj", "v_proj", "o_proj"}
-
-        # Inspect the actual model instead of assuming a fixed prefix.
-        all_modules = [
-            name
-            for name, _ in model.named_modules()
-            if name
+        peft_config.target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
         ]
-
-        print("\n" + "=" * 80)
-        print("MISTRAL SMALL 3.1: PEFT MODULE INSPECTION")
-        print("=" * 80)
-
-        print("\nAttention projection modules found in the model:")
-
-        attention_modules = [
-            name
-            for name in all_modules
-            if ".self_attn." in name
-            and name.rsplit(".", 1)[-1] in projection_names
-        ]
-
-        if not attention_modules:
-            print("WARNING: No matching attention projection modules found.")
-            print("\nModule names containing 'attn' or 'proj' (first 100):")
-
-            diagnostic_modules = [
-                name
-                for name in all_modules
-                if "attn" in name.lower() or "proj" in name.lower()
-            ]
-
-            for name in diagnostic_modules[:100]:
-                print(f"  {name}")
-
-            raise RuntimeError(
-                "Could not find q_proj/k_proj/v_proj/o_proj inside "
-                "self_attn modules. Inspect the diagnostic module names "
-                "above before configuring LoRA."
-            )
-
-        for name in attention_modules:
-            print(f"  {name}")
-
-        # Restrict LoRA to the language model's attention layers.
-        # Using the actual full names avoids assuming whether the prefix
-        # is model.language_model, language_model.model, or something else.
-        target_modules = [
-            name
-            for name in attention_modules
-            if "language_model" in name and ".layers." in name
-        ]
-
-        print("\nSelected LoRA target modules:")
-
-        if not target_modules:
-            print(
-                "WARNING: No language-model layer names matched the "
-                "expected structural pattern."
-            )
-            print("\nAvailable language_model module names (first 100):")
-
-            language_modules = [
-                name
-                for name in all_modules
-                if "language_model" in name
-                and ".self_attn." in name
-            ]
-
-            for name in language_modules[:100]:
-                print(f"  {name}")
-
-            raise RuntimeError(
-                "Could not identify language-model attention layers. "
-                "Inspect the printed module names and adjust the filter."
-            )
-
-        for name in target_modules:
-            print(f"  {name}")
-
-        # Confirm that all four projection types are represented.
-        found_projections = {
-            name.rsplit(".", 1)[-1]
-            for name in target_modules
-        }
-
-        missing_projections = projection_names - found_projections
-
-        if missing_projections:
-            raise RuntimeError(
-                f"Missing expected LoRA projections: "
-                f"{sorted(missing_projections)}"
-            )
-
-        print(f"\nTotal selected modules: {len(target_modules)}")
-        print(f"Projection types: {sorted(found_projections)}")
-        print("=" * 80 + "\n")
-
-        # PEFT accepts exact module names in target_modules lists.
-        # This avoids fragile, hard-coded regular expressions.
-        peft_config.target_modules = target_modules
 
     # Reference model
     if (
@@ -294,16 +201,12 @@ def main(script_args, training_args, model_args, dataset_args):
                 **tokenizer_kwargs,
             )
         except TypeError as e:
-            # Compatibility fallback for older Transformers versions.
             if "fix_mistral_regex" not in str(e):
                 raise
 
             logger.warning(
-                "This Transformers version does not support "
-                "fix_mistral_regex=True. The tokenizer will be loaded "
-                "without that fix; upgrading Transformers is recommended."
+                "fix_mistral_regex is unsupported by this Transformers version."
             )
-
             tokenizer = AutoTokenizer.from_pretrained(
                 model_args.model_name_or_path,
                 **tokenizer_kwargs,
@@ -341,15 +244,39 @@ def main(script_args, training_args, model_args, dataset_args):
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
     # Initialize the DPO trainer
-    trainer = DPOTrainer(
-        model,
-        ref_model,
-        args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=tokenizer,
-        peft_config=peft_config,
-    )
+    # --- FIX: Vision Registry Hack for Mistral 3.1 ---
+    if is_mistral_small_3:
+        logger.info("Mistral Small 3.1 detected: Applying TRL Vision Registry hack.")
+        mapping = modeling_auto.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
+        original_mistral3_entry = mapping.pop("mistral3", None)
+        try:
+            trainer = DPOTrainer(
+                model, ref_model, args=training_args,
+                train_dataset=dataset[script_args.dataset_train_split],
+                eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+                processing_class=tokenizer, peft_config=peft_config,
+            )
+        finally:
+            if original_mistral3_entry is not None:
+                mapping["mistral3"] = original_mistral3_entry
+
+        print("Model class:", type(model).__name__)
+        print("Vision model path:", trainer.is_vision_model)
+
+        if is_mistral_small_3 and trainer.is_vision_model:
+            raise RuntimeError(
+                "Mistral Small 3.1 is still using TRL's vision processing path. "
+                "Check the installed TRL model detection logic."
+            )
+
+    else:
+        # Normal path for all other models
+        trainer = DPOTrainer(
+            model, ref_model, args=training_args,
+            train_dataset=dataset[script_args.dataset_train_split],
+            eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+            processing_class=tokenizer, peft_config=peft_config,
+        )
 
     # Train the model
     trainer.train()
