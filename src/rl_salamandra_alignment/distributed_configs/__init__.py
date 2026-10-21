@@ -6,6 +6,7 @@ from typing import Literal
 
 DistributedConfigs = Literal[
     "DSZero3Offload",  # Zero 3 with CPU offload
+    "DSZero3",         # Zero 3 without offload
 ]
 
 
@@ -24,6 +25,8 @@ def get_distributed_config_path(
         pkg_resources.files('rl_salamandra_alignment'))
     if config_name == "DSZero3Offload":
         json_config = "zero_3_mn5_config.json"
+    elif config_name == "DSZero3":
+        json_config = "zero_3_mn5_nooffload_config.json"
     else:
         raise ValueError(
             f"Unvalid distributed computing configuration: {config_name}")

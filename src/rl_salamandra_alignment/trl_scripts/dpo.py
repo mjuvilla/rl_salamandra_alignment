@@ -281,30 +281,6 @@ def main(script_args, training_args, model_args, dataset_args):
             processing_class=tokenizer, peft_config=peft_config,
         )
 
-    ## TESTS
-    trainable_params = 0
-    total_params = 0
-
-    for name, param in trainer.model.named_parameters():
-        total_params += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-            if "lora_" in name:
-                print(
-                    f"Trainable LoRA parameter: {name}, "
-                    f"shape={tuple(param.shape)}"
-                )
-
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Total parameters: {total_params:,}")
-    print(
-        f"Trainable percentage: "
-        f"{100 * trainable_params / total_params:.6f}%"
-    )
-
-    assert trainable_params > 0, "No trainable parameters!"
-    ## TESTS
-
     # Train the model
     trainer.train()
 
