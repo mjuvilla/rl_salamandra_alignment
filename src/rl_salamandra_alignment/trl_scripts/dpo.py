@@ -312,6 +312,4 @@ if __name__ == "__main__":
     script_args, training_args, model_args, dataset_args, _ = parser.parse_args_and_config(
         return_remaining_strings=True
     )
-    if training_args.gradient_checkpointing:
-        training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
     main(script_args, training_args, model_args, dataset_args)
