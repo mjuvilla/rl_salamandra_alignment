@@ -69,8 +69,6 @@ from accelerate import logging
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from transformers.models.auto import modeling_auto
-
 from trl import (
     DatasetMixtureConfig,
     DPOConfig,
@@ -84,11 +82,15 @@ from trl import (
     get_quantization_config,
 )
 
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
-
 logger = logging.get_logger(__name__)
 
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+
+# removed: from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+SIMPLE_CHAT_TEMPLATE = (
+    "{% for message in messages %}{{message['role'].capitalize() + ': ' + message['content'] + '\n\n'}}{% endfor %}"
+    "{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
+)
 
 
 def main(script_args, training_args, model_args, dataset_args):
@@ -105,8 +107,8 @@ def main(script_args, training_args, model_args, dataset_args):
         or "mistral3" in model_id
     )
 
-    torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+    dtype = (
+        model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
     )
 
     attn_impl = model_args.attn_implementation
@@ -119,7 +121,7 @@ def main(script_args, training_args, model_args, dataset_args):
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=attn_impl,
-        torch_dtype=torch_dtype,
+        dtype=dtype,
     )
 
     quantization_config = get_quantization_config(model_args)
@@ -160,23 +162,7 @@ def main(script_args, training_args, model_args, dataset_args):
     peft_config = get_peft_config(model_args)
 
     if is_mistral_small_3 and peft_config is not None:
-        peft_config.target_modules = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-        ]
-
-    # Reference model
-    if (
-        not hasattr(training_args, "ref_model_path")
-        or (
-            training_args.ref_model_path is None
-            and isinstance(model_args.model_name_or_path, str)
-        )
-    ):
-        # If the reference model is not specified, assume it is the same as the initial modelAdd commentMore actions
-        training_args.ref_model_path = model_args.model_name_or_path
+        peft_config.target_modules = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj)"
 
     if peft_config is None:
         ref_model = model_class.from_pretrained(
@@ -247,39 +233,15 @@ def main(script_args, training_args, model_args, dataset_args):
         model.enable_input_require_grads()
 
     # Initialize the DPO trainer
-    # --- FIX: Vision Registry Hack for Mistral 3.1 ---
-    if is_mistral_small_3:
-        logger.info("Mistral Small 3.1 detected: Applying TRL Vision Registry hack.")
-        mapping = modeling_auto.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
-        original_mistral3_entry = mapping.pop("mistral3", None)
-        try:
-            trainer = DPOTrainer(
-                model, ref_model, args=training_args,
-                train_dataset=dataset[script_args.dataset_train_split],
-                eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-                processing_class=tokenizer, peft_config=peft_config,
-            )
-        finally:
-            if original_mistral3_entry is not None:
-                mapping["mistral3"] = original_mistral3_entry
+    trainer = DPOTrainer(
+        model, ref_model, args=training_args,
+        train_dataset=dataset[script_args.dataset_train_split],
+        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        processing_class=tokenizer, peft_config=peft_config,
+    )
 
-        print("Model class:", type(model).__name__)
-        print("Vision model path:", trainer.is_vision_model)
-
-        if is_mistral_small_3 and trainer.is_vision_model:
-            raise RuntimeError(
-                "Mistral Small 3.1 is still using TRL's vision processing path. "
-                "Check the installed TRL model detection logic."
-            )
-
-    else:
-        # Normal path for all other models
-        trainer = DPOTrainer(
-            model, ref_model, args=training_args,
-            train_dataset=dataset[script_args.dataset_train_split],
-            eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-            processing_class=tokenizer, peft_config=peft_config,
-        )
+    if is_mistral_small_3 and getattr(trainer, "_is_vlm", False):
+        raise RuntimeError("TRL is using its vision path for Mistral Small 3.1.")
 
     # Train the model
     trainer.train()
