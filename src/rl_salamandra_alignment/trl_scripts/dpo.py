@@ -101,6 +101,9 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         print("No fsdp_config detected!")
 
+    if training_args.gradient_checkpointing:
+        training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
+
     model_id = str(model_args.model_name_or_path).lower()
     is_mistral_small_3 = (
         "mistral-small-3.1" in model_id
