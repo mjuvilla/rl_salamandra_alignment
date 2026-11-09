@@ -165,7 +165,7 @@ def main(script_args, training_args, model_args, dataset_args):
     peft_config = get_peft_config(model_args)
 
     if is_mistral_small_3 and peft_config is not None:
-        peft_config.target_modules = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj)"
+        peft_config.target_modules = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
 
     if peft_config is None:
         ref_model = model_class.from_pretrained(
