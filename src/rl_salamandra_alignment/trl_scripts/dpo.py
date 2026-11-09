@@ -246,6 +246,26 @@ def main(script_args, training_args, model_args, dataset_args):
     if is_mistral_small_3 and getattr(trainer, "_is_vlm", False):
         raise RuntimeError("TRL is using its vision path for Mistral Small 3.1.")
 
+    def check_loaded(trainer, path):
+        import json, deepspeed
+        from safetensors import safe_open
+        key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        shard = json.load(open(f"{path}/model.safetensors.index.json"))["weight_map"][key]
+        with safe_open(f"{path}/{shard}", framework="pt") as f:
+            ref = f.get_tensor(key).float()
+        for name, p in trainer.model.named_parameters():
+            if "language_model" in name and name.endswith("layers.0.self_attn.q_proj.base_layer.weight"):
+                with deepspeed.zero.GatheredParameters([p]):  # collective: every rank must call it
+                    if torch.distributed.get_rank() == 0:
+                        w = p.detach().float().cpu()
+                        print("PARAM CHECK", name, "| mean|w| ours:", w.abs().mean().item(),
+                              "ref:", ref.abs().mean().item(), "| max abs diff:", (w - ref).abs().max().item(),
+                              flush=True)
+                return
+        print("PARAM CHECK: parameter not found", flush=True)
+
+    check_loaded(trainer, model_args.model_name_or_path)
+
     # Train the model
     trainer.train()
 
