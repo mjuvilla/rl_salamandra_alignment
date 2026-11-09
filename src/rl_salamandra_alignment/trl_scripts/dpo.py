@@ -246,25 +246,30 @@ def main(script_args, training_args, model_args, dataset_args):
     if is_mistral_small_3 and getattr(trainer, "_is_vlm", False):
         raise RuntimeError("TRL is using its vision path for Mistral Small 3.1.")
 
-    def check_loaded(trainer, path):
-        import json, deepspeed
-        from safetensors import safe_open
-        key = "model.language_model.layers.0.self_attn.q_proj.weight"
-        shard = json.load(open(f"{path}/model.safetensors.index.json"))["weight_map"][key]
-        with safe_open(f"{path}/{shard}", framework="pt") as f:
-            ref = f.get_tensor(key).float()
-        for name, p in trainer.model.named_parameters():
-            if "language_model" in name and name.endswith("layers.0.self_attn.q_proj.base_layer.weight"):
-                with deepspeed.zero.GatheredParameters([p]):  # collective: every rank must call it
-                    if torch.distributed.get_rank() == 0:
-                        w = p.detach().float().cpu()
-                        print("PARAM CHECK", name, "| mean|w| ours:", w.abs().mean().item(),
-                              "ref:", ref.abs().mean().item(), "| max abs diff:", (w - ref).abs().max().item(),
-                              flush=True)
-                return
-        print("PARAM CHECK: parameter not found", flush=True)
+    # --- LoRA sanity checks (after trainer init, before trainer.train()) ---
+    if peft_config is not None:
+        from collections import Counter
+        from peft.tuners.lora import LoraLayer
 
-    check_loaded(trainer, model_args.model_name_or_path)
+        lora_module_names = [n for n, m in trainer.model.named_modules() if isinstance(m, LoraLayer)]
+
+        # Count and per-projection breakdown
+        proj_breakdown = Counter(n.split(".")[-1] for n in lora_module_names)
+        logger.info(f"LoRA-wrapped modules: {len(lora_module_names)} | breakdown: {dict(proj_breakdown)}")
+        print(f"[LoRA sanity] modules={len(lora_module_names)}, breakdown={dict(proj_breakdown)}")
+
+        # No leakage into vision tower / projector
+        leaked = [n for n in lora_module_names if "language_model" not in n]
+        assert not leaked, f"LoRA modules outside language_model: {leaked[:5]}"
+
+        # Expected count: 40 layers x 7 projections
+        assert len(lora_module_names) == 280, f"expected 280 LoRA modules, got {len(lora_module_names)}"
+
+        # Trainable parameter count
+        n_trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in trainer.model.parameters())
+        print(f"[LoRA sanity] trainable params: {n_trainable:,} / {n_total:,} "
+              f"({100 * n_trainable / max(n_total, 1):.3f}%)")
 
     # Train the model
     trainer.train()
