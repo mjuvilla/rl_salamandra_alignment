@@ -67,7 +67,7 @@ import os
 import torch
 from accelerate import logging
 from datasets import load_from_disk
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from trl import (
     DatasetMixtureConfig,
@@ -133,12 +133,19 @@ def main(script_args, training_args, model_args, dataset_args):
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
+    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+
     # Model loading
     if is_mistral_small_3:
         logger.info(
             "Mistral Small 3.1 detected; loading "
             "Mistral3ForConditionalGeneration."
         )
+
+        # the model doesn't seem to learn without this fix
+        for c in (config, getattr(config, "text_config", None)):
+            if c is not None:
+                c.tie_word_embeddings = False
 
         try:
             from transformers.models.mistral3.modeling_mistral3 import (
@@ -157,6 +164,7 @@ def main(script_args, training_args, model_args, dataset_args):
 
     model = model_class.from_pretrained(
         model_args.model_name_or_path,
+        config=config,
         trust_remote_code=model_args.trust_remote_code,
         **model_kwargs,
     )
@@ -170,6 +178,7 @@ def main(script_args, training_args, model_args, dataset_args):
     if peft_config is None:
         ref_model = model_class.from_pretrained(
             model_args.model_name_or_path,
+            config=config,
             trust_remote_code=model_args.trust_remote_code,
             **model_kwargs,
         )
@@ -258,16 +267,17 @@ def main(script_args, training_args, model_args, dataset_args):
         logger.info(f"LoRA-wrapped modules: {len(lora_module_names)} | breakdown: {dict(proj_breakdown)}")
         print(f"[LoRA sanity] modules={len(lora_module_names)}, breakdown={dict(proj_breakdown)}")
 
-        # No leakage into vision tower / projector
-        leaked = [n for n in lora_module_names if "language_model" not in n]
-        assert not leaked, f"LoRA modules outside language_model: {leaked[:5]}"
+        if is_mistral_small_3:
+            # No leakage into vision tower / projector
+            leaked = [n for n in lora_module_names if "language_model" not in n]
+            assert not leaked, f"LoRA modules outside language_model: {leaked[:5]}"
 
-        # Expected count: 40 layers x 7 projections
-        assert len(lora_module_names) == 280, f"expected 280 LoRA modules, got {len(lora_module_names)}"
+            # Expected count: 40 layers x 7 projections
+            assert len(lora_module_names) == 280, f"expected 280 LoRA modules, got {len(lora_module_names)}"
 
         # Trainable parameter count
         n_trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
-        n_total = sum(p.numel() for p in trainer.model.parameters())
+        n_total = sum(getattr(p, "ds_numel", p.numel()) for p in trainer.model.parameters())
         print(f"[LoRA sanity] trainable params: {n_trainable:,} / {n_total:,} "
               f"({100 * n_trainable / max(n_total, 1):.3f}%)")
 
