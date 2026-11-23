@@ -17,6 +17,7 @@
 #     "trl @ git+https://github.com/huggingface/trl.git",
 #     "peft",
 #     "trackio",
+#     "mistral-common",
 # ]
 # ///
 
@@ -86,11 +87,99 @@ logger = logging.get_logger(__name__)
 
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
-# removed: from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+# Fallback template for non-Mistral models without a chat template.
 SIMPLE_CHAT_TEMPLATE = (
-    "{% for message in messages %}{{message['role'].capitalize() + ': ' + message['content'] + '\n\n'}}{% endfor %}"
+    "{% for message in messages %}"
+    "{{message['role'].capitalize() + ': ' + message['content'] + '\n\n'}}"
+    "{% endfor %}"
     "{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
 )
+
+
+def load_mistral_chat_template(tokenizer, model_path):
+    """
+    Generate the Hugging Face chat template from the local Mistral
+    Tekken tokenizer using mistral-common.
+    """
+
+    from mistral_common.integrations.chat_templates.chat_templates import (
+        convert_tokenizer_to_chat_template,
+    )
+
+    tekken_file = os.path.join(model_path, "tekken.json")
+
+    if not os.path.isfile(tekken_file):
+        raise FileNotFoundError(
+            f"Could not find Mistral Tekken tokenizer: {tekken_file}"
+        )
+
+    logger.info(f"Generating chat template from {tekken_file}")
+
+    tokenizer.chat_template = convert_tokenizer_to_chat_template(
+        tekken_file,
+        use_special_token_variables=True,
+    )
+
+    return tokenizer
+
+
+def validate_mistral_chat_template(tokenizer):
+    """
+    Validate that the generated template uses the expected Mistral
+    Small 3.1 V7-Tekken instruction format.
+    """
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        },
+        {
+            "role": "user",
+            "content": "What is 2 + 2?",
+        },
+        {
+            "role": "assistant",
+            "content": "The answer is 4.",
+        },
+    ]
+
+    formatted = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    logger.info("Mistral V7-Tekken template test:")
+    print(formatted)
+
+    expected_markers = [
+        "[SYSTEM_PROMPT]",
+        "[/SYSTEM_PROMPT]",
+        "[INST]",
+        "[/INST]",
+    ]
+
+    for marker in expected_markers:
+        if marker not in formatted:
+            raise RuntimeError(
+                f"Generated Mistral chat template is missing {marker!r}."
+                f"\nGenerated output:\n{formatted}"
+            )
+
+    token_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+
+    if not token_ids:
+        raise RuntimeError("Mistral chat template produced empty token IDs.")
+
+    logger.info(
+        f"Mistral chat template validation passed. "
+        f"Token count: {len(token_ids)}"
+    )
 
 
 def main(script_args, training_args, model_args, dataset_args):
@@ -104,11 +193,16 @@ def main(script_args, training_args, model_args, dataset_args):
     if training_args.gradient_checkpointing:
         training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
 
-    model_id = str(model_args.model_name_or_path).lower()
-    is_mistral_small_3 = (
-        "mistral-small-3.1" in model_id
-        or "mistral3" in model_id
+    config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
     )
+
+    is_mistral_small_3 = config.model_type == "mistral3"
+
+    logger.info(f"Model type: {config.model_type}")
+    logger.info(f"Mistral Small 3.1 detected: {is_mistral_small_3}")
 
     dtype = (
         model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
@@ -116,8 +210,7 @@ def main(script_args, training_args, model_args, dataset_args):
 
     attn_impl = model_args.attn_implementation
 
-    # Minimal Mistral-specific adjustment:
-    # use eager only when the configuration requests auto.
+    # Use eager attention when Mistral Small 3.1 requests auto.
     if is_mistral_small_3 and attn_impl == "auto":
         attn_impl = "eager"
 
@@ -129,11 +222,8 @@ def main(script_args, training_args, model_args, dataset_args):
 
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
-        # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
-
-    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
 
     # Model loading
     if is_mistral_small_3:
@@ -142,7 +232,7 @@ def main(script_args, training_args, model_args, dataset_args):
             "Mistral3ForConditionalGeneration."
         )
 
-        # the model doesn't seem to learn without this fix
+        # Mistral Small 3.1 doesn't seem to learn without this fix
         for c in (config, getattr(config, "text_config", None)):
             if c is not None:
                 c.tie_word_embeddings = False
@@ -183,7 +273,11 @@ def main(script_args, training_args, model_args, dataset_args):
             **model_kwargs,
         )
     else:
-        # With PEFT, DPOTrainer handles reference-policy behavior.
+
+        logger.info(
+            "PEFT enabled: DPOTrainer will handle reference-policy behavior."
+        )
+
         ref_model = None
 
     # Tokenizer
@@ -195,6 +289,7 @@ def main(script_args, training_args, model_args, dataset_args):
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 model_args.model_name_or_path,
+                revision=model_args.model_revision,
                 fix_mistral_regex=True,
                 **tokenizer_kwargs,
             )
@@ -207,18 +302,36 @@ def main(script_args, training_args, model_args, dataset_args):
             )
             tokenizer = AutoTokenizer.from_pretrained(
                 model_args.model_name_or_path,
+                revision=model_args.model_revision,
                 **tokenizer_kwargs,
             )
     else:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
+            revision=model_args.model_revision,
             **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.chat_template is None:
+
+    tokenizer.padding_side = "left"
+
+    # Chat template
+    if is_mistral_small_3:
+
+        tokenizer = load_mistral_chat_template(
+            tokenizer,
+            model_args.model_name_or_path,
+        )
+
+        # Validate the actual generated template.
+        validate_mistral_chat_template(tokenizer)
+
+    elif tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
+
+    # DDP buffer handling
     if script_args.ignore_bias_buffers:
         # torch distributed hack
         model._ddp_params_and_buffers_to_ignore = [
@@ -234,12 +347,17 @@ def main(script_args, training_args, model_args, dataset_args):
     elif dataset_args.datasets and not script_args.dataset_name:
         dataset = get_dataset(dataset_args)
     elif not dataset_args.datasets and script_args.dataset_name:
-        # dataset = load_dataset(
-        #     script_args.dataset_name, name=script_args.dataset_config, streaming=script_args.dataset_streaming
-        # )
         dataset = load_from_disk(script_args.dataset_name)
     else:
-        raise ValueError("Either `datasets` or `dataset_name` must be provided.")
+        raise ValueError(
+            "Either `datasets` or `dataset_name` must be provided."
+        )
+
+    logger.info(f"Dataset: {dataset}")
+
+    # ------------------------------------------------------------------
+    # Gradient checkpointing / PEFT
+    # ------------------------------------------------------------------
 
     if peft_config is not None and training_args.gradient_checkpointing:
         model.enable_input_require_grads()
@@ -252,42 +370,76 @@ def main(script_args, training_args, model_args, dataset_args):
         processing_class=tokenizer, peft_config=peft_config,
     )
 
-    if is_mistral_small_3 and getattr(trainer, "_is_vlm", False):
-        raise RuntimeError("TRL is using its vision path for Mistral Small 3.1.")
-
-    # --- LoRA sanity checks (after trainer init, before trainer.train()) ---
+    # LoRA sanity checks
     if peft_config is not None:
-        from collections import Counter
+
         from peft.tuners.lora import LoraLayer
 
-        lora_module_names = [n for n, m in trainer.model.named_modules() if isinstance(m, LoraLayer)]
+        lora_module_names = [
+            name
+            for name, module in trainer.model.named_modules()
+            if isinstance(module, LoraLayer)
+        ]
 
-        # Count and per-projection breakdown
-        proj_breakdown = Counter(n.split(".")[-1] for n in lora_module_names)
-        logger.info(f"LoRA-wrapped modules: {len(lora_module_names)} | breakdown: {dict(proj_breakdown)}")
-        print(f"[LoRA sanity] modules={len(lora_module_names)}, breakdown={dict(proj_breakdown)}")
+        proj_breakdown = Counter(
+            name.split(".")[-1]
+            for name in lora_module_names
+        )
+
+        logger.info(
+            f"LoRA-wrapped modules: {len(lora_module_names)} | "
+            f"breakdown: {dict(proj_breakdown)}"
+        )
+
+        print(
+            f"[LoRA sanity] modules={len(lora_module_names)}, "
+            f"breakdown={dict(proj_breakdown)}"
+        )
 
         if is_mistral_small_3:
-            # No leakage into vision tower / projector
-            leaked = [n for n in lora_module_names if "language_model" not in n]
-            assert not leaked, f"LoRA modules outside language_model: {leaked[:5]}"
 
-            # Expected count: 40 layers x 7 projections
-            assert len(lora_module_names) == 280, f"expected 280 LoRA modules, got {len(lora_module_names)}"
+            # Ensure LoRA does not leak into the vision tower/projector.
+            leaked = [
+                name
+                for name in lora_module_names
+                if "language_model" not in name
+            ]
 
-        # Trainable parameter count
-        n_trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
-        n_total = sum(getattr(p, "ds_numel", p.numel()) for p in trainer.model.parameters())
-        print(f"[LoRA sanity] trainable params: {n_trainable:,} / {n_total:,} "
-              f"({100 * n_trainable / max(n_total, 1):.3f}%)")
+            assert not leaked, (
+                f"LoRA modules outside language_model: {leaked[:5]}"
+            )
 
-    # Train the model
+            # Derive expected count from the actual architecture.
+            num_layers = config.text_config.num_hidden_layers
+            expected_modules = num_layers * 7
+
+            assert len(lora_module_names) == expected_modules, (
+                f"Expected {expected_modules} LoRA modules "
+                f"({num_layers} layers x 7 projections), "
+                f"got {len(lora_module_names)}"
+            )
+
+        # Trainable parameter count.
+        n_trainable = sum(
+            p.numel()
+            for p in trainer.model.parameters()
+            if p.requires_grad
+        )
+
+        n_total = sum(
+            getattr(p, "ds_numel", p.numel())
+            for p in trainer.model.parameters()
+        )
+
+        print(
+            f"[LoRA sanity] trainable params: "
+            f"{n_trainable:,} / {n_total:,} "
+            f"({100 * n_trainable / max(n_total, 1):.3f}%)"
+        )
+
+    # Training
+    logger.info("Starting DPO training.")
     trainer.train()
-
-    if training_args.eval_strategy != "no":
-        metrics = trainer.evaluate()
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
 
     # Save and push to Hub
     trainer.save_model(training_args.output_dir)
