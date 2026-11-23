@@ -374,6 +374,7 @@ def main(script_args, training_args, model_args, dataset_args):
     if peft_config is not None:
 
         from peft.tuners.lora import LoraLayer
+        from collections import Counter
 
         lora_module_names = [
             name
