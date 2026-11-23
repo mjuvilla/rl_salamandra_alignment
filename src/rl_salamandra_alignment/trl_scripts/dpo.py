@@ -167,6 +167,13 @@ def validate_mistral_chat_template(tokenizer):
                 f"\nGenerated output:\n{formatted}"
             )
 
+    ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_dict=False)
+    prompt_ids = tokenizer.apply_chat_template(messages[:-1], tokenize=True, add_generation_prompt=True,
+                                               return_dict=False)
+    assert ids[0] == tokenizer.bos_token_id, "template does not start with BOS"
+    assert ids[-1] == tokenizer.eos_token_id, "assistant answer does not end with EOS"
+    assert ids[: len(prompt_ids)] == prompt_ids, "prompt is not a prefix of prompt+answer (TRL splits on this)"
+
     token_ids = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
@@ -314,8 +321,6 @@ def main(script_args, training_args, model_args, dataset_args):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer.padding_side = "left"
 
     # Chat template
     if is_mistral_small_3:
