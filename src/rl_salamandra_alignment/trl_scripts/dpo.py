@@ -14,10 +14,12 @@
 
 import argparse
 import os
+
 import torch
 from accelerate import logging
 from datasets import load_dataset, load_from_disk
-from transformers import AutoProcessor, AutoModelForMultimodalLM
+from transformers import AutoModelForMultimodalLM, AutoProcessor
+
 from trl import (
     DatasetMixtureConfig,
     DPOConfig,
@@ -32,12 +34,19 @@ from trl import (
 )
 
 logger = logging.get_logger(__name__)
+
+# Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+
+# Gemma 4 is multimodal: "all-linear" would also hit the vision/audio towers.
+# Restrict LoRA to the language model's linear layers (check `print(model)` if the path differs).
+GEMMA4_LORA_TARGET_REGEX = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
 
 
 def main(script_args, training_args, model_args, dataset_args):
     if training_args.fsdp_config:
         print("printing fsdp_config")
+        print(type(training_args.fsdp_config))
         print(training_args.fsdp_config)
     else:
         print("No fsdp_config detected!")
@@ -45,33 +54,26 @@ def main(script_args, training_args, model_args, dataset_args):
     ################
     # Model Setup
     ###################
-    dtype_str = getattr(model_args, "dtype", "auto")
-
-    if dtype_str == "auto" or dtype_str is None:
-        torch_dtype = "auto"
-    else:
-        # Maps string "bfloat16" -> torch.bfloat16
-        torch_dtype = getattr(torch, dtype_str)
-
+    dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
-        torch_dtype=torch_dtype,
+        dtype=dtype,
     )
 
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
+        # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
-    # Load Gemma-4 using the Multimodal class
     model = AutoModelForMultimodalLM.from_pretrained(
-        model_args.model_name_or_path,
-        trust_remote_code=model_args.trust_remote_code,
-        **model_kwargs
+        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
 
     peft_config = get_peft_config(model_args)
+    if peft_config is not None and model_args.lora_target_modules in (None, ["all-linear"], "all-linear"):
+        peft_config.target_modules = GEMMA4_LORA_TARGET_REGEX
 
     # Reference Model Logic
     if (not hasattr(training_args, "ref_model_path") or
@@ -88,7 +90,6 @@ def main(script_args, training_args, model_args, dataset_args):
         # For LoRA, the reference model is handled internally by DPOTrainer
         ref_model = None
 
-    # Use AutoProcessor for Gemma-4
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=model_args.trust_remote_code
@@ -97,8 +98,13 @@ def main(script_args, training_args, model_args, dataset_args):
     tokenizer = processor.tokenizer
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
+    if tokenizer.chat_template is None:
+        raise ValueError(
+            f"No chat template found for {model_args.model_name_or_path}. "
+            "Refusing to fall back to a generic template; check the tokenizer/processor files."
+        )
     if script_args.ignore_bias_buffers:
+        # torch distributed hack
         model._ddp_params_and_buffers_to_ignore = [
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
@@ -120,16 +126,16 @@ def main(script_args, training_args, model_args, dataset_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=processor,
+        processing_class=tokenizer,
         peft_config=peft_config,
     )
 
     trainer.train()
 
-    if training_args.eval_strategy != "no":
-        metrics = trainer.evaluate()
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
+    # if training_args.eval_strategy != "no":
+    #     metrics = trainer.evaluate()
+    #     trainer.log_metrics("eval", metrics)
+    #     trainer.save_metrics("eval", metrics)
 
     trainer.save_model(training_args.output_dir)
     if training_args.push_to_hub:
