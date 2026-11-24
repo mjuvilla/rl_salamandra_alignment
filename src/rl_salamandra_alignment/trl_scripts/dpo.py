@@ -142,6 +142,16 @@ def main(script_args, training_args, model_args, dataset_args):
         if script_args.max_eval_samples is not None:
             eval_dataset = eval_dataset.select(range(min(script_args.max_eval_samples, len(eval_dataset))))
 
+    # Workaround for PEFT + DeepSpeed ZeRO-3 + gradient checkpointing
+    if peft_config is not None and training_args.gradient_checkpointing:
+        gc_kwargs = (
+            getattr(training_args, "gradient_checkpointing_kwargs", None) or {}
+        )
+        training_args.gradient_checkpointing_kwargs = {
+            **gc_kwargs,
+            "use_reentrant": True,
+        }
+
     trainer = DPOTrainer(
         model,
         ref_model,
