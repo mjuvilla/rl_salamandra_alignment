@@ -17,7 +17,7 @@ import os
 import torch
 from accelerate import logging
 from datasets import load_dataset, load_from_disk
-from transformers import AutoProcessor, AutoModelForMultimodalLM  # Changed for Gemma-4
+from transformers import AutoProcessor, AutoModelForMultimodalLM
 from trl import (
     DatasetMixtureConfig,
     DPOConfig,
@@ -45,9 +45,13 @@ def main(script_args, training_args, model_args, dataset_args):
     ################
     # Model Setup
     ###################
-    torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
-    )
+    dtype_str = getattr(model_args, "dtype", "auto")
+
+    if dtype_str == "auto" or dtype_str is None:
+        torch_dtype = "auto"
+    else:
+        # Maps string "bfloat16" -> torch.bfloat16
+        torch_dtype = getattr(torch, dtype_str)
 
     model_kwargs = dict(
         revision=model_args.model_revision,
@@ -59,9 +63,6 @@ def main(script_args, training_args, model_args, dataset_args):
     if quantization_config is not None:
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
-    else:
-        # For 31B models, we usually want device_map="auto" unless using FSDP
-        model_kwargs["device_map"] = "auto"
 
     # Load Gemma-4 using the Multimodal class
     model = AutoModelForMultimodalLM.from_pretrained(
@@ -78,25 +79,21 @@ def main(script_args, training_args, model_args, dataset_args):
         training_args.ref_model_path = model_args.model_name_or_path
 
     if peft_config is None:
-        # Full fine tuning
         ref_model = AutoModelForMultimodalLM.from_pretrained(
             model_args.model_name_or_path,
             trust_remote_code=model_args.trust_remote_code,
             **model_kwargs
         )
     else:
-        # LoRA: DPOTrainer handles the reference model internally by
-        # disabling adapters on the policy model, saving VRAM.
+        # For LoRA, the reference model is handled internally by DPOTrainer
         ref_model = None
 
-    # Use AutoProcessor instead of AutoTokenizer for Gemma-4
+    # Use AutoProcessor for Gemma-4
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=model_args.trust_remote_code
     )
 
-    # The DPOTrainer expects a tokenizer-like object for the 'processing_class'
-    # AutoProcessor for Gemma-4 contains the tokenizer needed for text DPO.
     tokenizer = processor.tokenizer
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -123,7 +120,7 @@ def main(script_args, training_args, model_args, dataset_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=processor,  # Pass the processor here
+        processing_class=processor,
         peft_config=peft_config,
     )
 
