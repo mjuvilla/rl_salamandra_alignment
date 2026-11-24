@@ -19,6 +19,8 @@ import torch
 from accelerate import logging
 from datasets import load_dataset, load_from_disk
 from transformers import AutoModelForMultimodalLM, AutoProcessor
+from dataclasses import dataclass, field
+from typing import Optional
 
 from trl import (
     DatasetMixtureConfig,
@@ -34,6 +36,15 @@ from trl import (
 )
 
 logger = logging.get_logger(__name__)
+
+@dataclass
+class DPOScriptArguments(ScriptArguments):
+    max_train_samples: Optional[int] = field(
+        default=None, metadata={"help": "Use only the first N training examples (smoke tests)."}
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None, metadata={"help": "Use only the first N eval examples (smoke tests)."}
+    )
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
@@ -120,12 +131,22 @@ def main(script_args, training_args, model_args, dataset_args):
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
     # Initialize the DPO trainer
+    train_dataset = dataset[script_args.dataset_train_split]
+    if script_args.max_train_samples is not None:
+        train_dataset = train_dataset.select(range(min(script_args.max_train_samples, len(train_dataset))))
+
+    eval_dataset = None
+    if training_args.eval_strategy != "no":
+        eval_dataset = dataset[script_args.dataset_test_split]
+        if script_args.max_eval_samples is not None:
+            eval_dataset = eval_dataset.select(range(min(script_args.max_eval_samples, len(eval_dataset))))
+
     trainer = DPOTrainer(
         model,
         ref_model,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
     )
@@ -143,7 +164,7 @@ def main(script_args, training_args, model_args, dataset_args):
 
 
 def make_parser(subparsers: argparse._SubParsersAction = None):
-    dataclass_types = (ScriptArguments, DPOConfig, ModelConfig, DatasetMixtureConfig)
+    dataclass_types = (DPOScriptArguments, DPOConfig, ModelConfig, DatasetMixtureConfig)
     if subparsers is not None:
         parser = subparsers.add_parser("dpo", help="Run the DPO training script", dataclass_types=dataclass_types)
     else:
