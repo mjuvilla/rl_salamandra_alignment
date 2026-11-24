@@ -18,7 +18,7 @@ import os
 import torch
 from accelerate import logging
 from datasets import load_dataset, load_from_disk
-from transformers import AutoModelForMultimodalLM, AutoProcessor
+from transformers import AutoModelForMultimodalLM, AutoTokenizer
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -101,12 +101,11 @@ def main(script_args, training_args, model_args, dataset_args):
         # For LoRA, the reference model is handled internally by DPOTrainer
         ref_model = None
 
-    processor = AutoProcessor.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        trust_remote_code=model_args.trust_remote_code
+        trust_remote_code=model_args.trust_remote_code,
     )
 
-    tokenizer = processor.tokenizer
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.chat_template is None:
