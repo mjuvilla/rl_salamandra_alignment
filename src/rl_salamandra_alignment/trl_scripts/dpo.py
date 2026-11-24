@@ -106,6 +106,8 @@ def main(script_args, training_args, model_args, dataset_args):
         trust_remote_code=model_args.trust_remote_code,
     )
 
+    tokenizer.chat_template_kwargs = {"enable_thinking": False}
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.chat_template is None:
