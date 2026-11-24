@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-from accelerate import logging
+from accelerate import PartialState, logging
 from datasets import load_dataset, load_from_disk
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -88,16 +88,20 @@ def load_local_dataset(path, train_split, test_split):
     return load_dataset("json", data_files=data_files)
 
 
-def check_chat_template(tokenizer, dataset, n=3):
+SENTINEL = "@@ANSWER@@"
+
+
+def chat_template_is_consistent(tokenizer, dataset, n=3):
     """TRL splits every conversational example into prompt and answer by rendering the template twice
-    (prompt + generation prompt, and prompt + answer). The first must be a prefix of the second, otherwise
-    chosen/rejected tokens are silently misaligned (e.g. a thinking-channel block that appears in only one)."""
+    (prompt + generation prompt, and prompt + answer) and cutting the second after the length of the first.
+    That only works if the first is a prefix of the second. Templates that add something only when generating
+    (e.g. Gemma 4's empty thinking block) break it, and the answers would silently lose their first tokens."""
     for i in range(min(n, len(dataset))):
         ex = dataset[i]
         prompt, chosen, rejected = ex.get("prompt"), ex["chosen"], ex["rejected"]
         if prompt is None or isinstance(chosen, str):
             logger.warning("Data without explicit conversational prompt: chat template check skipped.")
-            return
+            return True
         prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
         for name, answer in (("chosen", chosen), ("rejected", rejected)):
             full_text = tokenizer.apply_chat_template(prompt + answer, tokenize=False)
@@ -105,12 +109,37 @@ def check_chat_template(tokenizer, dataset, n=3):
                 print(f"[template check] prompt  tail: {prompt_text[-160:]!r}")
                 print(f"[template check] {name:8s} tail: {full_text[-160:]!r}")
             if not full_text.startswith(prompt_text):
-                raise RuntimeError(
-                    f"Chat template check failed on example {i} ({name}): the rendered prompt is not a prefix of "
-                    f"prompt+answer, so TRL would misalign the completion tokens.\n"
-                    f"prompt     : {prompt_text[-300:]!r}\nprompt+answer: {full_text[:len(prompt_text) + 100][-400:]!r}"
-                )
+                print(f"[template check] MISMATCH on example {i} ({name}): the rendered prompt is not a prefix of "
+                      f"prompt+answer.\n  prompt        : {prompt_text[-200:]!r}\n"
+                      f"  prompt+answer : {full_text[:len(prompt_text) + 60][-260:]!r}")
+                return False
     print("[template check] prompt is a prefix of prompt+answer: OK")
+    return True
+
+
+def to_completion_format(example, tokenizer):
+    """Conversational example -> plain-text prompt/completion pair that matches inference:
+       prompt     = the generation prompt exactly as the model sees it when generating (incl. any empty thinking block)
+       completion = the answer as the template renders it, up to and including the end-of-turn token.
+    The assistant-turn header is found by rendering a sentinel answer, so this does not depend on the template."""
+    prompt = example["prompt"]
+    gen_prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    with_sentinel = tokenizer.apply_chat_template(
+        prompt + [{"role": "assistant", "content": SENTINEL}], tokenize=False
+    )
+    header = with_sentinel[: with_sentinel.index(SENTINEL)]  # everything before the answer text
+    if not gen_prompt.startswith(header):
+        raise RuntimeError(
+            f"Cannot align the generation prompt with the assistant header.\n"
+            f"generation prompt: {gen_prompt[-200:]!r}\nassistant header : {header[-200:]!r}"
+        )
+    out = {"prompt": gen_prompt}
+    for key in ("chosen", "rejected"):
+        full = tokenizer.apply_chat_template(prompt + example[key], tokenize=False)
+        if not full.startswith(header):
+            raise RuntimeError(f"Rendered {key} answer does not start with the assistant header: {full[-200:]!r}")
+        out[key] = full[len(header):].rstrip("\n")  # drop the newline after the end-of-turn token
+    return out
 
 
 def main(script_args, training_args, model_args, dataset_args):
@@ -176,7 +205,21 @@ def main(script_args, training_args, model_args, dataset_args):
         eval_dataset = eval_dataset.select(range(min(script_args.max_eval_samples, len(eval_dataset))))
     logger.info(f"Train examples: {len(train_dataset)} | eval examples: {len(eval_dataset) if eval_dataset else 0}")
 
-    check_chat_template(tokenizer, train_dataset)
+    if not chat_template_is_consistent(tokenizer, train_dataset):
+        logger.warning(
+            "The chat template renders extra tokens after the assistant header only when generating (e.g. an empty "
+            "thinking block), so TRL's prompt/answer split would be misaligned. Converting the data to plain-text "
+            "prompt/completion pairs: prompt = generation prompt, completion = answer + end-of-turn token."
+        )
+        with PartialState().main_process_first():
+            map_kwargs = dict(fn_kwargs={"tokenizer": tokenizer}, num_proc=training_args.dataset_num_proc)
+            train_dataset = train_dataset.map(to_completion_format, desc="Converting train data", **map_kwargs)
+            if eval_dataset is not None:
+                eval_dataset = eval_dataset.map(to_completion_format, desc="Converting eval data", **map_kwargs)
+        ex = train_dataset[0]
+        print(f"[format] prompt tail  : {ex['prompt'][-160:]!r}")
+        print(f"[format] chosen head  : {ex['chosen'][:80]!r}")
+        print(f"[format] chosen tail  : {ex['chosen'][-80:]!r}")
 
     # ------------------------------------------------------------------ model
     dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
