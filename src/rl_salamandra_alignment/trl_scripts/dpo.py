@@ -20,6 +20,10 @@ Differences from the stock TRL script:
   * there is no silent chat-template fallback: the tokenizer must have its own template;
   * --max_train_samples / --max_eval_samples shrink the data for smoke tests;
   * the `datasets` + `dataset_name` branch actually loads the data.
+
+Smoke test example (in the yaml, under rl_script_args):
+    max_train_samples: 320
+    max_eval_samples: 32
 """
 
 import argparse
@@ -62,20 +66,25 @@ class DPOScriptArguments(ScriptArguments):
     )
 
 
-def load_local_dataset(path):
+def load_local_dataset(path, train_split, test_split):
     """Load `dataset_name` from disk. Accepts:
       * a folder written with save_to_disk (a DatasetDict with train/eval splits),
-      * a folder of .jsonl/.json files, each named after its split (train.jsonl, eval.jsonl),
-      * a single .jsonl/.json file (becomes the `train` split)."""
+      * a folder of .jsonl/.json files: every file goes into the train split, except files whose name is exactly
+        a split name (e.g. eval.jsonl for the eval split, train.jsonl is added to train),
+      * a single .jsonl/.json file (becomes the train split)."""
     if os.path.isfile(path):
-        return load_dataset("json", data_files={"train": path})
+        return load_dataset("json", data_files={train_split: path})
     if os.path.isfile(os.path.join(path, "dataset_dict.json")) or os.path.isfile(os.path.join(path, "state.json")):
         return load_from_disk(path)
     files = sorted(glob.glob(os.path.join(path, "*.jsonl")) + glob.glob(os.path.join(path, "*.json")))
     if not files:
         raise ValueError(f"{path} is not a save_to_disk dataset and contains no .jsonl/.json files.")
-    data_files = {os.path.splitext(os.path.basename(f))[0]: f for f in files}
-    logger.info(f"Loading jsonl splits from {path}: {data_files}")
+    data_files = {}
+    for f in files:
+        stem = os.path.splitext(os.path.basename(f))[0]
+        split = stem if stem in (train_split, test_split) else train_split
+        data_files.setdefault(split, []).append(f)
+    logger.info(f"Loading jsonl files from {path}: {data_files}")
     return load_dataset("json", data_files=data_files)
 
 
@@ -145,7 +154,7 @@ def main(script_args, training_args, model_args, dataset_args):
     elif dataset_args.datasets and not script_args.dataset_name:
         dataset = get_dataset(dataset_args)
     elif not dataset_args.datasets and script_args.dataset_name:
-        dataset = load_local_dataset(script_args.dataset_name)
+        dataset = load_local_dataset(script_args.dataset_name, script_args.dataset_train_split, script_args.dataset_test_split)
     else:
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
@@ -155,8 +164,8 @@ def main(script_args, training_args, model_args, dataset_args):
     missing = [split for split in needed if split not in dataset]
     if missing:
         raise ValueError(
-            f"Dataset splits {missing} not found; available: {list(dataset.keys())}. For jsonl folders the file "
-            "names are the split names (train.jsonl, eval.jsonl), or set eval_strategy: 'no'."
+            f"Dataset splits {missing} not found; available: {list(dataset.keys())}. A jsonl folder only gets an "
+            "eval split from a file named after it (e.g. eval.jsonl); otherwise set eval_strategy: 'no'."
         )
 
     train_dataset = dataset[script_args.dataset_train_split]
