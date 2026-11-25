@@ -162,6 +162,11 @@ def main(script_args, training_args, model_args, dataset_args):
         peft_config=peft_config,
     )
 
+    ex = trainer.train_dataset[0]
+    print("prompt tail :", repr(tokenizer.decode(ex["prompt_ids"][-10:])))
+    print("chosen head :", repr(tokenizer.decode(ex["chosen_ids"][:10])))
+    print("chosen tail :", repr(tokenizer.decode(ex["chosen_ids"][-6:])))
+
     trainer.train()
 
     # if training_args.eval_strategy != "no":
